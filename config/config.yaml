@@ -1,0 +1,9 @@
+server:
+  port: 8080
+
+backends:
+  v1: "http://192.168.11.0"
+  v2: "http://192.168.11.1"
+
+# 当前激活版本: v1 或 v2
+active_version: "v1"
