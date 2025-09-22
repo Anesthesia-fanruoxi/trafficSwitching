@@ -196,10 +196,7 @@ func checkBackendHealth(backendURL string) bool {
 		return false
 	}
 	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-
-		}
+		_ = Body.Close()
 	}(resp.Body)
 
 	// 检查状态码是否为200
@@ -347,9 +344,9 @@ func MetricsHandler(c *gin.Context) {
 		"proxy": gin.H{
 			"cache_size": cacheSize,
 			"transport": gin.H{
-				"max_idle_conns":          2000,
+				"max_idle_conns":          6000,
 				"max_idle_conns_per_host": 200,
-				"max_conns_per_host":      500,
+				"max_conns_per_host":      400,
 			},
 		},
 		"runtime": gin.H{

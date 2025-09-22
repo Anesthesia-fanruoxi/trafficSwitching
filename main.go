@@ -93,6 +93,6 @@ func setupRuntime() {
 	// 设置GC百分比
 	oldGCPercent := debug.SetGCPercent(gcPercent)
 
-	log.Printf("极限运行时优化: CPU核心数=%d, GOMAXPROCS=%d, GCPercent=%d->%d",
+	log.Printf("当前运行参数: CPU核心数=%d, GOMAXPROCS=%d, GCPercent=%d->%d",
 		numCPU, runtime.GOMAXPROCS(0), oldGCPercent, gcPercent)
 }
