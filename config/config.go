@@ -41,9 +41,7 @@ func LoadConfig(filename string) error {
 	// 尝试从隐藏文件恢复上次的激活版本
 	if savedVersion := loadSavedVersion(); savedVersion != "" {
 		config.ActiveVersion = savedVersion
-		log.Printf("成功恢复上次激活版本: %s", savedVersion)
-	} else {
-		log.Printf("使用配置文件默认版本: %s", config.ActiveVersion)
+		// 移除版本恢复日志，减少输出
 	}
 
 	return nil
@@ -69,7 +67,7 @@ func SwitchVersion(version string) bool {
 
 		// 保存到隐藏文件
 		if err := saveVersion(version); err != nil {
-			log.Printf("错误: 无法保存版本状态: %v", err)
+			log.Printf("ERROR: 无法保存版本状态: %v", err)
 			// 回滚内存状态
 			config.ActiveVersion = oldVersion
 			return false

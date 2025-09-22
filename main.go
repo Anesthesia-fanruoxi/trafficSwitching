@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"syscall"
 	"time"
 	"trafficSwitching/api"
 	"trafficSwitching/config"
@@ -44,9 +48,6 @@ func main() {
 	// 性能监控
 	r.GET("/metrics", api.MetricsHandler)
 
-	// 健康检查
-	r.GET("/health-check", api.HealthCheckHandler)
-
 	// 启动服务
 	port := config.GetServerPort()
 	addr := fmt.Sprintf(":%d", port)
@@ -65,7 +66,28 @@ func main() {
 		MaxHeaderBytes:    1 << 21,           // 2MB请求头限制
 	}
 
-	log.Fatal(server.ListenAndServe())
+	// 优雅关闭支持
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("服务启动失败: %v", err)
+		}
+	}()
+
+	// 等待中断信号
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("正在关闭服务...")
+
+	// 给服务30秒时间完成现有请求
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("服务关闭超时: %v", err)
+	} else {
+		log.Println("服务已优雅关闭")
+	}
 }
 
 // 设置Go运行时参数 - 极限性能优化

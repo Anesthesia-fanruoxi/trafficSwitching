@@ -23,6 +23,9 @@ var (
 	proxyCache = make(map[string]*httputil.ReverseProxy)
 	proxyMutex sync.RWMutex
 
+	// 缓存配置
+	maxCacheSize = 2 // 最大缓存数量，防止无限增长
+
 	// 性能计数器
 	totalRequests   int64
 	successRequests int64
@@ -35,6 +38,20 @@ var (
 		"dns_error":          []byte(`{"error": "后端服务不可用", "exception": "dns_error", "detail": "DNS解析失败"}`),
 		"connection_reset":   []byte(`{"error": "后端服务不可用", "exception": "connection_reset", "detail": "连接重置"}`),
 		"backend_error":      []byte(`{"error": "后端服务不可用", "exception": "backend_error", "detail": "后端服务错误"}`),
+	}
+
+	// 健康检查专用客户端 - 复用连接
+	healthCheckClient = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     60 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout: 2 * time.Second,
+			}).DialContext,
+			ResponseHeaderTimeout: 3 * time.Second,
+		},
 	}
 
 	// 生产级高性能配置 - 针对Gateway 30个Pod优化
@@ -105,7 +122,7 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 
 		errStr := err.Error()
 		switch {
-		case len(errStr) > 17 && errStr[len(errStr)-17:] == "connection refused":
+		case strings.HasSuffix(errStr, "connection refused"):
 			errorType = "connection_refused"
 			statusCode = http.StatusServiceUnavailable
 		case strings.Contains(errStr, "timeout"):
@@ -130,14 +147,23 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 		}
 
 		// 条件日志记录（减少IO开销）
-		if atomic.LoadInt64(&errorRequests)%1000 == 0 { // 每1000个错误记录一次
-			log.Printf("ERROR: [%s] 累计错误数: %d", errorType, atomic.LoadInt64(&errorRequests))
+		if currentErrors := atomic.LoadInt64(&errorRequests); currentErrors%1000 == 0 { // 每1000个错误记录一次
+			log.Printf("ERROR: [%s] 累计错误数: %d", errorType, currentErrors)
 		}
 
 		// 快速响应写入
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(statusCode)
 		_, _ = w.Write(response)
+	}
+
+	// 简单的缓存大小控制
+	if len(proxyCache) >= maxCacheSize {
+		// 删除第一个缓存项（简单的FIFO策略）
+		for k := range proxyCache {
+			delete(proxyCache, k)
+			break
+		}
 	}
 
 	proxyCache[backend] = proxy
@@ -180,17 +206,7 @@ func ProxyHandler(c *gin.Context) {
 
 // 后端健康检查
 func checkBackendHealth(backendURL string) bool {
-	client := &http.Client{
-		Timeout: 5 * time.Second, // 5秒超时
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout: 2 * time.Second,
-			}).DialContext,
-			ResponseHeaderTimeout: 3 * time.Second,
-		},
-	}
-
-	resp, err := client.Get(backendURL)
+	resp, err := healthCheckClient.Get(backendURL)
 	if err != nil {
 		log.Printf("后端健康检查失败 %s: %v", backendURL, err)
 		return false
@@ -279,42 +295,6 @@ func StatusHandler(c *gin.Context) {
 	})
 }
 
-// 手动健康检查接口
-func HealthCheckHandler(c *gin.Context) {
-	version := c.Query("version")
-	if version == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请指定版本参数，例如: ?version=v1"})
-		return
-	}
-
-	// 获取目标后端URL
-	var targetBackend string
-	v1, v2 := config.GetBackends()
-
-	switch version {
-	case "v1":
-		targetBackend = v1
-	case "v2":
-		targetBackend = v2
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的版本，只支持 v1 或 v2"})
-		return
-	}
-
-	// 执行健康检查
-	startTime := time.Now()
-	isHealthy := checkBackendHealth(targetBackend)
-	checkDuration := time.Since(startTime)
-
-	c.JSON(http.StatusOK, gin.H{
-		"version":           version,
-		"backend":           targetBackend,
-		"healthy":           isHealthy,
-		"check_duration_ms": checkDuration.Milliseconds(),
-		"timestamp":         time.Now().Unix(),
-	})
-}
-
 // 性能监控接口
 func MetricsHandler(c *gin.Context) {
 	var m runtime.MemStats
@@ -342,7 +322,8 @@ func MetricsHandler(c *gin.Context) {
 			"success_rate": fmt.Sprintf("%.2f%%", successRate),
 		},
 		"proxy": gin.H{
-			"cache_size": cacheSize,
+			"cache_size":     cacheSize,
+			"max_cache_size": maxCacheSize,
 			"transport": gin.H{
 				"max_idle_conns":          6000,
 				"max_idle_conns_per_host": 200,
