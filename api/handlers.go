@@ -206,22 +206,26 @@ func ProxyHandler(c *gin.Context) {
 
 // 后端健康检查
 func checkBackendHealth(backendURL string) bool {
-	resp, err := healthCheckClient.Get(backendURL)
+	// 拼接健康检查端点
+	healthAPI := config.GetHealthAPI()
+	healthURL := backendURL + healthAPI
+
+	resp, err := healthCheckClient.Get(healthURL)
 	if err != nil {
-		log.Printf("后端健康检查失败 %s: %v", backendURL, err)
+		log.Printf("后端健康检查失败 %s: %v", healthURL, err)
 		return false
 	}
 	defer func(Body io.ReadCloser) {
 		_ = Body.Close()
 	}(resp.Body)
 
-	// 检查状态码是否为200
-	if resp.StatusCode == 200 {
-		log.Printf("后端健康检查通过 %s: 状态码 %d", backendURL, resp.StatusCode)
+	// 检查状态码是否为200或2xx
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("后端健康检查通过 %s: 状态码 %d", healthURL, resp.StatusCode)
 		return true
 	}
 
-	log.Printf("后端健康检查失败 %s: 状态码 %d", backendURL, resp.StatusCode)
+	log.Printf("后端健康检查失败 %s: 状态码 %d", healthURL, resp.StatusCode)
 	return false
 }
 

@@ -16,6 +16,7 @@ type Config struct {
 		V1 string `yaml:"v1"`
 		V2 string `yaml:"v2"`
 	} `yaml:"backends"`
+	HealthAPI     string `yaml:"health_api"`
 	ActiveVersion string `yaml:"active_version"`
 	mu            sync.RWMutex
 }
@@ -95,6 +96,16 @@ func GetBackends() (string, string) {
 	config.mu.RLock()
 	defer config.mu.RUnlock()
 	return config.Backends.V1, config.Backends.V2
+}
+
+// GetHealthAPI 获取健康检查端点，如果未配置则返回默认值
+func GetHealthAPI() string {
+	config.mu.RLock()
+	defer config.mu.RUnlock()
+	if config.HealthAPI == "" {
+		return "/actuator/health" // 默认值
+	}
+	return config.HealthAPI
 }
 
 // 保存版本到隐藏文件 - 极简实现
