@@ -47,9 +47,16 @@ type MetricsResponse struct {
 
 // 全局统计计数器（轻量级原子操作）
 var (
-	TotalRequests   int64
-	SuccessRequests int64
-	ErrorRequests   int64
+	TotalRequests    int64
+	SuccessRequests  int64
+	ErrorRequests    int64 // 代理层错误（连接失败等）
+	CanceledRequests int64 // 客户端取消（不算失败）
+
+	// 后端状态码统计
+	Status2xx int64
+	Status3xx int64
+	Status4xx int64
+	Status5xx int64
 
 	// 实时指标
 	ActiveConnections int64 // 当前活跃连接数
@@ -58,7 +65,7 @@ var (
 	lastErrors        int64 // 上次统计时的错误数
 	currentQPS        int64 // 当前 QPS
 	currentSuccessQPS int64 // 每秒成功数
-	currentErrorQPS   int64 // 每秒错误数
+	currentErrorQPS   int64 // 每秒代理错误数
 
 	// 延迟统计（纳秒）
 	totalLatency int64 // 当前秒累计延迟
@@ -78,9 +85,41 @@ func IncrementSuccess() {
 	atomic.AddInt64(&SuccessRequests, 1)
 }
 
-// IncrementError 增加错误数
+// IncrementError 增加代理层错误数
 func IncrementError() {
 	atomic.AddInt64(&ErrorRequests, 1)
+}
+
+// IncrementCanceled 增加客户端取消数
+func IncrementCanceled() {
+	atomic.AddInt64(&CanceledRequests, 1)
+}
+
+// GetCanceled 获取客户端取消数
+func GetCanceled() int64 {
+	return atomic.LoadInt64(&CanceledRequests)
+}
+
+// RecordStatusCode 记录后端状态码
+func RecordStatusCode(status int) {
+	switch {
+	case status >= 200 && status < 300:
+		atomic.AddInt64(&Status2xx, 1)
+	case status >= 300 && status < 400:
+		atomic.AddInt64(&Status3xx, 1)
+	case status >= 400 && status < 500:
+		atomic.AddInt64(&Status4xx, 1)
+	case status >= 500:
+		atomic.AddInt64(&Status5xx, 1)
+	}
+}
+
+// GetStatusCodeStats 获取状态码统计
+func GetStatusCodeStats() (s2xx, s3xx, s4xx, s5xx int64) {
+	return atomic.LoadInt64(&Status2xx),
+		atomic.LoadInt64(&Status3xx),
+		atomic.LoadInt64(&Status4xx),
+		atomic.LoadInt64(&Status5xx)
 }
 
 // IncrementActive 增加活跃连接数
@@ -145,18 +184,18 @@ func StartRealtimeMetrics() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			// QPS
+			// 同时采样所有计数器（减少时间差）
 			total := atomic.LoadInt64(&TotalRequests)
-			atomic.StoreInt64(&currentQPS, total-atomic.LoadInt64(&lastTotal))
-			atomic.StoreInt64(&lastTotal, total)
-
-			// 成功/错误 QPS
 			success := atomic.LoadInt64(&SuccessRequests)
 			errors := atomic.LoadInt64(&ErrorRequests)
-			atomic.StoreInt64(&currentSuccessQPS, success-atomic.LoadInt64(&lastSuccess))
-			atomic.StoreInt64(&currentErrorQPS, errors-atomic.LoadInt64(&lastErrors))
-			atomic.StoreInt64(&lastSuccess, success)
-			atomic.StoreInt64(&lastErrors, errors)
+			prevTotal := atomic.SwapInt64(&lastTotal, total)
+			prevSuccess := atomic.SwapInt64(&lastSuccess, success)
+			prevErrors := atomic.SwapInt64(&lastErrors, errors)
+
+			// 计算 QPS
+			atomic.StoreInt64(&currentQPS, total-prevTotal)
+			atomic.StoreInt64(&currentSuccessQPS, success-prevSuccess)
+			atomic.StoreInt64(&currentErrorQPS, errors-prevErrors)
 
 			// 延迟统计
 			count := atomic.SwapInt64(&latencyCount, 0)
@@ -179,37 +218,45 @@ func GetRequestStats() (total, success, errors int64) {
 		atomic.LoadInt64(&ErrorRequests)
 }
 
-// CalculateSuccessRate 计算成功率（避免重复计算）
+// CalculateSuccessRate 计算成功率（排除正在处理的请求，4位小数）
 func CalculateSuccessRate(success, total int64) string {
-	if total == 0 {
-		return "0.00%"
+	// 排除正在处理的请求
+	active := atomic.LoadInt64(&ActiveConnections)
+	completed := total - active
+	if completed <= 0 {
+		return "0.0000%"
 	}
-	rate := float64(success) / float64(total) * 100
-	// 使用固定格式，避免sprintf开销
-	if rate >= 99.995 {
-		return "100.00%"
+	rate := float64(success) / float64(completed) * 100
+	if rate >= 99.99995 {
+		return "100.0000%"
 	}
-	return formatFloat(rate)
+	return formatFloat4(rate)
 }
 
-// formatFloat 格式化浮点数（轻量级实现，支持0-100）
-func formatFloat(f float64) string {
+// formatFloat4 格式化浮点数（4位小数）
+func formatFloat4(f float64) string {
 	intPart := int(f)
-	decPart := int((f-float64(intPart))*100 + 0.5) // 四舍五入
+	decPart := int((f-float64(intPart))*10000 + 0.5) // 4位小数，四舍五入
 
 	// 处理进位
-	if decPart >= 100 {
+	if decPart >= 10000 {
 		intPart++
 		decPart = 0
 	}
 
 	// 处理100%的情况
 	if intPart >= 100 {
-		return "100.00%"
+		return "100.0000%"
 	}
 
+	// 构建字符串：XX.XXXX%
+	d1 := decPart / 1000
+	d2 := (decPart / 100) % 10
+	d3 := (decPart / 10) % 10
+	d4 := decPart % 10
+
 	return string(rune(intPart/10+'0')) + string(rune(intPart%10+'0')) + "." +
-		string(rune(decPart/10+'0')) + string(rune(decPart%10+'0')) + "%"
+		string(rune(d1+'0')) + string(rune(d2+'0')) + string(rune(d3+'0')) + string(rune(d4+'0')) + "%"
 }
 
 // GetTimestamp 获取当前时间戳（复用）

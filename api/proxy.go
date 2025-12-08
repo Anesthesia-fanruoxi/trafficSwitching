@@ -111,11 +111,12 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 
 	// 错误处理 - 统计错误类型
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		model.IncrementError()
+		w.Header().Set("X-Proxy-Error", "1") // 标记代理错误
 
 		// 识别错误类型
 		var errorType string
 		var statusCode int
+		var isCanceled bool
 
 		errStr := err.Error()
 		switch {
@@ -131,9 +132,28 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 		case strings.Contains(errStr, "connection reset"):
 			errorType = "connection_reset"
 			statusCode = http.StatusBadGateway
+		case strings.Contains(errStr, "EOF"):
+			errorType = "eof"
+			statusCode = http.StatusBadGateway
+		case strings.Contains(errStr, "broken pipe"):
+			errorType = "broken_pipe"
+			statusCode = http.StatusBadGateway
+		case strings.Contains(errStr, "context canceled"):
+			errorType = "client_canceled"
+			statusCode = http.StatusBadGateway
+			isCanceled = true
 		default:
 			errorType = "backend_error"
 			statusCode = http.StatusBadGateway
+			// 记录未分类的错误，方便排查
+			log.Printf("WARN: 未分类错误: %s", errStr)
+		}
+
+		// 客户端取消单独计数，不算失败
+		if isCanceled {
+			model.IncrementCanceled()
+		} else {
+			model.IncrementError()
 		}
 
 		// 错误类型统计（轻量级）
@@ -205,12 +225,15 @@ func ProxyHandler(c *gin.Context) {
 	// 执行代理转发
 	proxy.ServeHTTP(c.Writer, c.Request)
 
-	// 根据响应状态码判断成功/失败（ErrorHandler已处理错误计数）
-	status := c.Writer.Status()
-	if status == 0 || (status >= 200 && status < 400) {
+	// 判断成功/失败
+	// ErrorHandler 会设置特定的响应头标记代理错误
+	if c.Writer.Header().Get("X-Proxy-Error") == "" {
+		// 代理成功（后端正常响应）
 		model.IncrementSuccess()
+		// 记录后端状态码
+		model.RecordStatusCode(c.Writer.Status())
 	}
-	// 注：4xx/5xx 由 ErrorHandler 计数，此处不重复计数
+	// 代理失败由 ErrorHandler 处理，已调用 IncrementError()
 }
 
 // GetProxyStats 获取代理统计（供metrics使用）

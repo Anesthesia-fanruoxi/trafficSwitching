@@ -57,7 +57,14 @@ func BuildFlatMetricsResponse() map[string]interface{} {
 		"total_requests":     total,
 		"total_success":      success,
 		"total_errors":       errors,
+		"total_canceled":     model.GetCanceled(),
 		"total_success_rate": successRate,
+
+		// 4. 后端状态码（status_）
+		"status_2xx": model.Status2xx,
+		"status_3xx": model.Status3xx,
+		"status_4xx": model.Status4xx,
+		"status_5xx": model.Status5xx,
 
 		// 4. 代理配置（proxy_）
 		"proxy_cache_size":     proxyStats.CacheSize,
@@ -76,9 +83,19 @@ func BuildFlatMetricsResponse() map[string]interface{} {
 		"runtime_gomaxprocs": runtime.GOMAXPROCS(0),
 	}
 
-	// 7. 错误类型（error_）
+	// 7. 错误类型（error_）- 始终显示所有类型
+	response["error_connection_refused"] = int64(0)
+	response["error_timeout"] = int64(0)
+	response["error_dns_error"] = int64(0)
+	response["error_connection_reset"] = int64(0)
+	response["error_eof"] = int64(0)
+	response["error_broken_pipe"] = int64(0)
+	response["error_backend_error"] = int64(0)
+	// 用实际值覆盖（跳过 client_canceled，已在 total_canceled 中统计）
 	for errType, count := range errorTypes {
-		response["error_"+errType] = count
+		if errType != "client_canceled" {
+			response["error_"+errType] = count
+		}
 	}
 
 	return response
