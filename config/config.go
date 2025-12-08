@@ -18,7 +18,16 @@ type Config struct {
 	} `yaml:"backends"`
 	HealthAPI     string `yaml:"health_api"`
 	ActiveVersion string `yaml:"active_version"`
-	mu            sync.RWMutex
+	Report        struct {
+		Enable   bool   `yaml:"enable"`
+		Project  string `yaml:"project"`
+		Source   string `yaml:"source"`
+		Service  string `yaml:"service"`
+		Interval string `yaml:"interval"`
+		URL      string `yaml:"url"`
+		Salt     string `yaml:"salt"` // AES密钥，必须16/24/32字节
+	} `yaml:"report"`
+	mu sync.RWMutex
 }
 
 var (
@@ -106,6 +115,14 @@ func GetHealthAPI() string {
 		return "/actuator/health" // 默认值
 	}
 	return config.HealthAPI
+}
+
+// GetReportConfig 获取上报配置
+func GetReportConfig() (enable bool, project, source, service, interval, url, salt string) {
+	config.mu.RLock()
+	defer config.mu.RUnlock()
+	return config.Report.Enable, config.Report.Project, config.Report.Source, config.Report.Service,
+		config.Report.Interval, config.Report.URL, config.Report.Salt
 }
 
 // 保存版本到隐藏文件 - 极简实现

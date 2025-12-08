@@ -1,12 +1,22 @@
 server:
-  port: 8080
+  port: 8082
 
 backends:
-  v1: "http://192.168.11.0"
-  v2: "http://192.168.11.1"
+  v1: "http://192.168.11.1:8080"  # 修复：使用正确的主机IP和端口
+  v2: "http://192.168.11.2:8080"  # 修复：使用正确的主机IP和端口
 
 # 健康检查端点，默认为 /actuator/health
 health_api: "/actuator/health"
 
 # 当前激活版本: v1 或 v2
 active_version: "v1"
+
+# 上报配置
+report:
+  enable: true                            # 是否启用上报
+  project: "test"                         # 项目名称
+  source: "trafficSwitching"
+  service: "gateway"                         # 绑定服务
+  interval: "5s"                         # 上报间隔
+  url: "http://192.168.100.128:8081/metrics_data"
+  salt: "yiDoETicN1M06v7pb1zdhSc3QFOFOaRq"
