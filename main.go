@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"syscall"
 	"time"
+	"trafficSwitching/api"
 	"trafficSwitching/config"
 	"trafficSwitching/model"
 	"trafficSwitching/reporter"
@@ -29,6 +30,10 @@ func main() {
 
 	// 启动实时指标计算器
 	model.StartRealtimeMetrics()
+
+	// 启动每日重置（7天滚动窗口）
+	model.OnDailyReset = api.ResetErrorTypeStats // 注册错误类型重置回调
+	model.InitDailyReset()
 
 	// 启动上报功能
 	reporter.Start()

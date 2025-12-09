@@ -26,7 +26,10 @@ func MetricsHandler(c *gin.Context) {
 
 // BuildFlatMetricsResponse 构建扁平化监控响应（Prometheus友好）
 func BuildFlatMetricsResponse() map[string]interface{} {
-	// 获取请求统计
+	// 获取今日统计
+	todayReq, todaySuccess, todayErrors, todayCanceled, todayS2xx, todayS3xx, todayS4xx, todayS5xx := model.GetTodayStats()
+
+	// 获取历史累计统计
 	total, success, errors := model.GetRequestStats()
 	successRate := model.CalculateSuccessRate(success, total)
 
@@ -53,18 +56,21 @@ func BuildFlatMetricsResponse() map[string]interface{} {
 		"realtime_avg_latency_ms":     model.GetAvgLatencyMs(),
 		"realtime_max_latency_ms":     model.GetMaxLatencyMs(),
 
-		// 3. 累计统计（total_）
+		// 3. 今日统计（每日 0 点自动重置）
+		"today_requests":   todayReq,
+		"today_success":    todaySuccess,
+		"today_errors":     todayErrors,
+		"today_canceled":   todayCanceled,
+		"today_status_2xx": todayS2xx,
+		"today_status_3xx": todayS3xx,
+		"today_status_4xx": todayS4xx,
+		"today_status_5xx": todayS5xx,
+
+		// 4. 历史累计（永不重置）
 		"total_requests":     total,
 		"total_success":      success,
 		"total_errors":       errors,
-		"total_canceled":     model.GetCanceled(),
 		"total_success_rate": successRate,
-
-		// 4. 后端状态码（status_）
-		"status_2xx": model.Status2xx,
-		"status_3xx": model.Status3xx,
-		"status_4xx": model.Status4xx,
-		"status_5xx": model.Status5xx,
 
 		// 4. 代理配置（proxy_）
 		"proxy_cache_size":     proxyStats.CacheSize,

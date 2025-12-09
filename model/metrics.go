@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+// 每日重置
+var (
+	currentDay   string // 当前日期
+	OnDailyReset func() // 每日重置回调（用于重置其他模块的计数器）
+)
+
 // RequestStats 请求统计
 type RequestStats struct {
 	Total       int64            `json:"total"`
@@ -47,12 +53,23 @@ type MetricsResponse struct {
 
 // 全局统计计数器（轻量级原子操作）
 var (
+	// 当天统计（每日 0 点重置）
+	TodayRequests  int64
+	TodaySuccess   int64
+	TodayErrors    int64
+	TodayCanceled  int64
+	TodayStatus2xx int64
+	TodayStatus3xx int64
+	TodayStatus4xx int64
+	TodayStatus5xx int64
+
+	// 历史累计（永不重置）
 	TotalRequests    int64
 	SuccessRequests  int64
 	ErrorRequests    int64 // 代理层错误（连接失败等）
 	CanceledRequests int64 // 客户端取消（不算失败）
 
-	// 后端状态码统计
+	// 后端状态码统计（历史累计）
 	Status2xx int64
 	Status3xx int64
 	Status4xx int64
@@ -75,51 +92,76 @@ var (
 	currentMaxMs int64 // 最大延迟（毫秒）
 )
 
-// IncrementTotal 增加总请求数
+// IncrementTotal 增加总请求数（同时更新今天和历史）
 func IncrementTotal() {
+	atomic.AddInt64(&TodayRequests, 1)
 	atomic.AddInt64(&TotalRequests, 1)
 }
 
-// IncrementSuccess 增加成功数
+// IncrementSuccess 增加成功数（同时更新今天和历史）
 func IncrementSuccess() {
+	atomic.AddInt64(&TodaySuccess, 1)
 	atomic.AddInt64(&SuccessRequests, 1)
 }
 
-// IncrementError 增加代理层错误数
+// IncrementError 增加代理层错误数（同时更新今天和历史）
 func IncrementError() {
+	atomic.AddInt64(&TodayErrors, 1)
 	atomic.AddInt64(&ErrorRequests, 1)
 }
 
-// IncrementCanceled 增加客户端取消数
+// IncrementCanceled 增加客户端取消数（同时更新今天和历史）
 func IncrementCanceled() {
+	atomic.AddInt64(&TodayCanceled, 1)
 	atomic.AddInt64(&CanceledRequests, 1)
 }
 
-// GetCanceled 获取客户端取消数
+// GetCanceled 获取客户端取消数（历史累计）
 func GetCanceled() int64 {
 	return atomic.LoadInt64(&CanceledRequests)
 }
 
-// RecordStatusCode 记录后端状态码
+// GetTodayCanceled 获取今日取消数
+func GetTodayCanceled() int64 {
+	return atomic.LoadInt64(&TodayCanceled)
+}
+
+// RecordStatusCode 记录后端状态码（同时更新今天和历史）
 func RecordStatusCode(status int) {
 	switch {
 	case status >= 200 && status < 300:
+		atomic.AddInt64(&TodayStatus2xx, 1)
 		atomic.AddInt64(&Status2xx, 1)
 	case status >= 300 && status < 400:
+		atomic.AddInt64(&TodayStatus3xx, 1)
 		atomic.AddInt64(&Status3xx, 1)
 	case status >= 400 && status < 500:
+		atomic.AddInt64(&TodayStatus4xx, 1)
 		atomic.AddInt64(&Status4xx, 1)
 	case status >= 500:
+		atomic.AddInt64(&TodayStatus5xx, 1)
 		atomic.AddInt64(&Status5xx, 1)
 	}
 }
 
-// GetStatusCodeStats 获取状态码统计
+// GetStatusCodeStats 获取状态码统计（历史累计）
 func GetStatusCodeStats() (s2xx, s3xx, s4xx, s5xx int64) {
 	return atomic.LoadInt64(&Status2xx),
 		atomic.LoadInt64(&Status3xx),
 		atomic.LoadInt64(&Status4xx),
 		atomic.LoadInt64(&Status5xx)
+}
+
+// GetTodayStats 获取今日统计
+func GetTodayStats() (requests, success, errors, canceled, s2xx, s3xx, s4xx, s5xx int64) {
+	return atomic.LoadInt64(&TodayRequests),
+		atomic.LoadInt64(&TodaySuccess),
+		atomic.LoadInt64(&TodayErrors),
+		atomic.LoadInt64(&TodayCanceled),
+		atomic.LoadInt64(&TodayStatus2xx),
+		atomic.LoadInt64(&TodayStatus3xx),
+		atomic.LoadInt64(&TodayStatus4xx),
+		atomic.LoadInt64(&TodayStatus5xx)
 }
 
 // IncrementActive 增加活跃连接数
@@ -218,11 +260,12 @@ func GetRequestStats() (total, success, errors int64) {
 		atomic.LoadInt64(&ErrorRequests)
 }
 
-// CalculateSuccessRate 计算成功率（排除正在处理的请求，4位小数）
+// CalculateSuccessRate 计算成功率（排除正在处理和取消的请求，4位小数）
 func CalculateSuccessRate(success, total int64) string {
-	// 排除正在处理的请求
+	// 排除正在处理的请求和客户端取消的请求
 	active := atomic.LoadInt64(&ActiveConnections)
-	completed := total - active
+	canceled := atomic.LoadInt64(&CanceledRequests)
+	completed := total - active - canceled
 	if completed <= 0 {
 		return "0.0000%"
 	}
@@ -262,4 +305,45 @@ func formatFloat4(f float64) string {
 // GetTimestamp 获取当前时间戳（复用）
 func GetTimestamp() int64 {
 	return time.Now().Unix()
+}
+
+// InitDailyReset 初始化每日重置（在 main 中调用）
+func InitDailyReset() {
+	currentDay = time.Now().Format("2006-01-02")
+	go dailyResetLoop()
+}
+
+// dailyResetLoop 每日重置循环
+func dailyResetLoop() {
+	for {
+		now := time.Now()
+		today := now.Format("2006-01-02")
+
+		// 检查是否跨天
+		if today != currentDay {
+			resetDailyStats()
+			currentDay = today
+		}
+
+		// 计算到下一个 0 点的时间
+		next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 1, 0, now.Location())
+		time.Sleep(next.Sub(now))
+	}
+}
+
+// resetDailyStats 每日重置当天计数器（历史累计不重置）
+func resetDailyStats() {
+	atomic.StoreInt64(&TodayRequests, 0)
+	atomic.StoreInt64(&TodaySuccess, 0)
+	atomic.StoreInt64(&TodayErrors, 0)
+	atomic.StoreInt64(&TodayCanceled, 0)
+	atomic.StoreInt64(&TodayStatus2xx, 0)
+	atomic.StoreInt64(&TodayStatus3xx, 0)
+	atomic.StoreInt64(&TodayStatus4xx, 0)
+	atomic.StoreInt64(&TodayStatus5xx, 0)
+
+	// 调用外部重置回调（如重置错误类型统计）
+	if OnDailyReset != nil {
+		OnDailyReset()
+	}
 }

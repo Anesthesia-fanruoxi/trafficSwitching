@@ -195,16 +195,18 @@ func ProxyHandler(c *gin.Context) {
 
 	// 活跃连接数 +1，请求结束时 -1 并记录延迟
 	model.IncrementActive()
-	defer func() {
-		model.DecrementActive()
-		model.RecordLatency(time.Since(start).Nanoseconds())
-	}()
 
 	// 请求计数
 	model.IncrementTotal()
 
 	// 获取后端
 	backend := config.GetActiveBackend()
+
+	// 请求日志
+	clientIP := c.ClientIP()
+	method := c.Request.Method
+	path := c.Request.URL.Path
+	log.Printf("[REQ] %s %s %s -> %s", clientIP, method, path, backend)
 
 	// 快速路径：直接从缓存获取代理
 	proxyMutex.RLock()
@@ -216,6 +218,8 @@ func ProxyHandler(c *gin.Context) {
 		proxy = getOrCreateProxy(backend)
 		if proxy == nil {
 			model.IncrementError()
+			model.DecrementActive()
+			log.Printf("[ERR] %s %s %s -> 代理初始化失败", clientIP, method, path)
 			c.Header("Content-Type", "application/json")
 			c.String(http.StatusInternalServerError, string(model.ErrProxyInitError))
 			return
@@ -225,15 +229,22 @@ func ProxyHandler(c *gin.Context) {
 	// 执行代理转发
 	proxy.ServeHTTP(c.Writer, c.Request)
 
+	// 记录延迟和活跃连接
+	latency := time.Since(start)
+	model.DecrementActive()
+	model.RecordLatency(latency.Nanoseconds())
+
 	// 判断成功/失败
-	// ErrorHandler 会设置特定的响应头标记代理错误
+	status := c.Writer.Status()
 	if c.Writer.Header().Get("X-Proxy-Error") == "" {
 		// 代理成功（后端正常响应）
 		model.IncrementSuccess()
-		// 记录后端状态码
-		model.RecordStatusCode(c.Writer.Status())
+		model.RecordStatusCode(status)
+		log.Printf("[RES] %s %s %s -> %d %v", clientIP, method, path, status, latency)
+	} else {
+		// 代理失败
+		log.Printf("[ERR] %s %s %s -> %d %v (proxy error)", clientIP, method, path, status, latency)
 	}
-	// 代理失败由 ErrorHandler 处理，已调用 IncrementError()
 }
 
 // GetProxyStats 获取代理统计（供metrics使用）
@@ -265,4 +276,18 @@ func GetErrorTypeStats() map[string]int64 {
 		}
 	}
 	return errorStats
+}
+
+// ResetErrorTypeStats 重置错误类型统计（每日重置时调用）
+func ResetErrorTypeStats() {
+	proxyMutex.Lock()
+	defer proxyMutex.Unlock()
+
+	for errType, counter := range errorTypeCount {
+		if counter != nil {
+			atomic.StoreInt64(counter, 0)
+		}
+		// 或者直接删除
+		delete(errorTypeCount, errType)
+	}
 }
