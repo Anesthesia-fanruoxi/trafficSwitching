@@ -84,7 +84,7 @@ func BuildFlatMetricsResponse() map[string]interface{} {
 		// 6. 运行时（runtime_）
 		"runtime_goroutines": runtime.NumGoroutine(),
 		"runtime_memory_mb":  m.Alloc / 1024 / 1024,
-		"runtime_gc_cycles":  m.NumGC,
+		"runtime_gc_cycles":  model.GetGCCount(),
 		"runtime_cpu_cores":  runtime.NumCPU(),
 		"runtime_gomaxprocs": runtime.GOMAXPROCS(0),
 	}
@@ -151,7 +151,7 @@ func getRuntimeStats() *model.RuntimeStats {
 	return &model.RuntimeStats{
 		Goroutines: runtime.NumGoroutine(),
 		MemoryMB:   m.Alloc / 1024 / 1024,
-		GCCycles:   m.NumGC,
+		GCCycles:   model.GetGCCount(),
 		CPUCores:   runtime.NumCPU(),
 		GoMaxProcs: runtime.GOMAXPROCS(0),
 	}

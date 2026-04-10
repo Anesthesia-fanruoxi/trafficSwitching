@@ -1,6 +1,7 @@
 package model
 
 import (
+	"runtime"
 	"sync/atomic"
 	"time"
 )
@@ -90,6 +91,10 @@ var (
 	maxLatency   int64 // 当前秒最大延迟
 	currentAvgMs int64 // 平均延迟（毫秒）
 	currentMaxMs int64 // 最大延迟（毫秒）
+
+	// GC统计（5秒窗口）
+	lastGCCount    uint32 // 上次采样时的GC次数
+	currentGCCount uint32 // 5秒窗口内的GC次数
 )
 
 // IncrementTotal 增加总请求数（同时更新今天和历史）
@@ -204,6 +209,11 @@ func GetMaxLatencyMs() int64 {
 	return atomic.LoadInt64(&currentMaxMs)
 }
 
+// GetGCCount 获取5秒窗口内的GC次数
+func GetGCCount() uint32 {
+	return atomic.LoadUint32(&currentGCCount)
+}
+
 // RecordLatency 记录请求延迟（纳秒）
 func RecordLatency(latencyNs int64) {
 	atomic.AddInt64(&totalLatency, latencyNs)
@@ -222,9 +232,15 @@ func RecordLatency(latencyNs int64) {
 
 // StartRealtimeMetrics 启动实时指标计算器（每秒更新）
 func StartRealtimeMetrics() {
+	// 初始化GC计数
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	atomic.StoreUint32(&lastGCCount, m.NumGC)
+
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		gcTick := 0 // GC统计计数器
 		for range ticker.C {
 			// 同时采样所有计数器（减少时间差）
 			total := atomic.LoadInt64(&TotalRequests)
@@ -249,6 +265,16 @@ func StartRealtimeMetrics() {
 				atomic.StoreInt64(&currentAvgMs, 0)
 			}
 			atomic.StoreInt64(&currentMaxMs, maxLat/1e6)
+
+			// GC统计（每5秒更新）
+			gcTick++
+			if gcTick >= 5 {
+				gcTick = 0
+				var ms runtime.MemStats
+				runtime.ReadMemStats(&ms)
+				prevGC := atomic.SwapUint32(&lastGCCount, ms.NumGC)
+				atomic.StoreUint32(&currentGCCount, ms.NumGC-prevGC)
+			}
 		}
 	}()
 }

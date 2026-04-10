@@ -28,6 +28,9 @@ func main() {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 
+	// 启动配置文件热更新监听（后台运行，每5秒轮询检查一次变化）
+	config.WatchConfig("config/config.yaml")
+
 	// 启动实时指标计算器
 	model.StartRealtimeMetrics()
 

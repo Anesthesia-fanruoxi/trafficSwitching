@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"log"
 	"net"
 	"net/http"
@@ -56,6 +57,23 @@ var (
 	}
 )
 
+// 拦截逻辑封装：读取 O(1) 预计算字典并替换为底层小写
+func restoreLowerHeaders(headers http.Header, phase string) {
+	lowerMap := config.GetParsedLowerHeadersMap()
+	if len(lowerMap) == 0 {
+		return
+	}
+
+	// Fast lookup & replace
+	for canonicalKey, lowerKey := range lowerMap {
+		if vals, exists := headers[canonicalKey]; exists {
+			// 直接从底层 map 中删除大写并强行写入小写
+			delete(headers, canonicalKey)
+			headers[lowerKey] = vals
+		}
+	}
+}
+
 // getOrCreateProxy 获取或创建代理实例
 func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 	proxyMutex.RLock()
@@ -97,7 +115,6 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 		}
 
 		if req.Header.Get("X-Real-IP") == "" {
-			// 从 X-Forwarded-For 取第一个 IP
 			if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
 				if idx := strings.Index(xff, ","); idx > 0 {
 					req.Header.Set("X-Real-IP", strings.TrimSpace(xff[:idx]))
@@ -107,6 +124,15 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 			}
 		}
 
+		// 动态转换为小写 Header 发往后端
+		restoreLowerHeaders(req.Header, "发往后端请求")
+	}
+
+	// ModifyResponse: 请注意，不能在此处修改返回的小写头！
+	// 因为 ReverseProxy 会在这个函数执行完毕后，调用原生 copyHeader((w).Add)，使得我们的小写替换前功尽弃被再次大写化。
+	// 真正的返回头拦截我们移动到了下方的 proxyResponseWriter 中！
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		return nil
 	}
 
 	// 错误处理 - 统计错误类型
@@ -188,6 +214,40 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 	return proxy
 }
 
+// proxyResponseWriter 自定义写入包装器，用于在响应打给 TCP 网卡之前，夺取最高控制权
+type proxyResponseWriter struct {
+	http.ResponseWriter
+}
+
+// WriteHeader 拦截冲刷 HTTP Header 时的函数
+func (w *proxyResponseWriter) WriteHeader(status int) {
+	restoreLowerHeaders(w.Header(), "发向前端响应")
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// Flush 支持原生的 Server-Sent Events 或 Streaming 流式能力
+func (w *proxyResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack 支持 Websocket 的透传能力
+func (w *proxyResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// CloseNotify 保持低版本兼容性
+func (w *proxyResponseWriter) CloseNotify() <-chan bool {
+	if c, ok := w.ResponseWriter.(http.CloseNotifier); ok {
+		return c.CloseNotify()
+	}
+	return nil
+}
+
 // ProxyHandler 代理处理器（带连接统计）
 func ProxyHandler(c *gin.Context) {
 	// 记录开始时间
@@ -195,18 +255,16 @@ func ProxyHandler(c *gin.Context) {
 
 	// 活跃连接数 +1，请求结束时 -1 并记录延迟
 	model.IncrementActive()
+	defer func() {
+		model.DecrementActive()
+		model.RecordLatency(time.Since(start).Nanoseconds())
+	}()
 
 	// 请求计数
 	model.IncrementTotal()
 
 	// 获取后端
 	backend := config.GetActiveBackend()
-
-	// 请求日志
-	clientIP := c.ClientIP()
-	method := c.Request.Method
-	path := c.Request.URL.Path
-	log.Printf("[REQ] %s %s %s -> %s", clientIP, method, path, backend)
 
 	// 快速路径：直接从缓存获取代理
 	proxyMutex.RLock()
@@ -218,33 +276,27 @@ func ProxyHandler(c *gin.Context) {
 		proxy = getOrCreateProxy(backend)
 		if proxy == nil {
 			model.IncrementError()
-			model.DecrementActive()
-			log.Printf("[ERR] %s %s %s -> 代理初始化失败", clientIP, method, path)
 			c.Header("Content-Type", "application/json")
 			c.String(http.StatusInternalServerError, string(model.ErrProxyInitError))
 			return
 		}
 	}
 
-	// 执行代理转发
-	proxy.ServeHTTP(c.Writer, c.Request)
+	// 用我们的包裹器把 Gin 的默认响应包起来
+	pw := &proxyResponseWriter{ResponseWriter: c.Writer}
 
-	// 记录延迟和活跃连接
-	latency := time.Since(start)
-	model.DecrementActive()
-	model.RecordLatency(latency.Nanoseconds())
+	// 执行代理转发
+	proxy.ServeHTTP(pw, c.Request)
 
 	// 判断成功/失败
-	status := c.Writer.Status()
-	if c.Writer.Header().Get("X-Proxy-Error") == "" {
+	// ErrorHandler 会设置特定的响应头标记代理错误
+	if pw.Header().Get("X-Proxy-Error") == "" {
 		// 代理成功（后端正常响应）
 		model.IncrementSuccess()
-		model.RecordStatusCode(status)
-		log.Printf("[RES] %s %s %s -> %d %v", clientIP, method, path, status, latency)
-	} else {
-		// 代理失败
-		log.Printf("[ERR] %s %s %s -> %d %v (proxy error)", clientIP, method, path, status, latency)
+		// 记录后端状态码 (这里不能用 c.Writer.Status 因为可能被包裹了，改用原生)
+		model.RecordStatusCode(c.Writer.Status())
 	}
+	// 代理失败由 ErrorHandler 处理，已调用 IncrementError()
 }
 
 // GetProxyStats 获取代理统计（供metrics使用）

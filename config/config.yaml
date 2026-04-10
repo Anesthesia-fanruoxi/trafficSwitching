@@ -2,7 +2,7 @@ server:
   port: 8082
 
 backends:
-  v1: "http://192.168.11.1:8080"  # 修复：使用正确的主机IP和端口
+  v1: "http://192.168.3.10:43137"  # 修复：使用正确的主机IP和端口
   v2: "http://192.168.11.2:8080"  # 修复：使用正确的主机IP和端口
 
 # 健康检查端点，默认为 /actuator/health
@@ -13,10 +13,23 @@ active_version: "v1"
 
 # 上报配置
 report:
-  enable: true                            # 是否启用上报
-  project: "test"                         # 项目名称
-  source: "trafficSwitching"
-  service: "gateway"                         # 绑定服务
-  interval: "5s"                         # 上报间隔
-  url: "http://192.168.100.128:8081/metrics_data"
-  salt: "yiDoETicN1M06v7pb1zdhSc3QFOFOaRq"
+# 是否启用上报
+  enable: true
+# 项目名称，需要修改
+  project: "test"                                 
+# 上报来源，无需修改
+  source: "trafficSwitching"                      
+# 绑定服务，需要修改
+  service: "gateway"                              
+# 上报间隔
+  interval: "5s"                                  
+# 上报地址，无需修改
+  url: ""
+# 加密盐，无需修改
+  salt: ""
+
+# 代理层特殊配置
+proxy:
+  # 强制转为小写的 Header 列表
+  force_lower_headers:
+    - "gw-sign"
