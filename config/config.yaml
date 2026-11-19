@@ -5,9 +5,6 @@ backends:
   v1: "http://192.168.3.10:43137"  # 修复：使用正确的主机IP和端口
   v2: "http://192.168.11.2:8080"  # 修复：使用正确的主机IP和端口
 
-# 健康检查端点，默认为 /actuator/health
-health_api: "/actuator/health"
-
 # 当前激活版本: v1 或 v2
 active_version: "v1"
 
@@ -23,7 +20,10 @@ report:
   service: "gateway"                              
 # 上报间隔
   interval: "5s"                                  
-# 上报地址，无需修改
+# 上报地址与加密盐属于敏感项，不写入本文件（会被版本控制）：
+# 方式一：创建 config/config.local.yaml（已 .gitignore），填写 report.url / report.salt
+# 方式二：设置环境变量 TS_REPORT_URL / TS_REPORT_SALT（优先级最高）
+# 两者都不配置时，url/salt 为空，上报功能会自动跳过（salt 长度校验不通过）
   url: ""
 # 加密盐，无需修改
   salt: ""
@@ -32,4 +32,9 @@ report:
 proxy:
   # 强制转为小写的 Header 列表
   force_lower_headers:
+    - "gw-encrypt-type"
+    - "jrgw-respond-time"
+    - "jrgw-resp-code"
+    - "jrgw-resp-msg"
+    - "jrgw-resp-env-key"
     - "gw-sign"

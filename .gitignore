@@ -1,0 +1,28 @@
+# ===== 敏感配置（密钥/上报地址不入库）=====
+config/config.local.yaml
+config/.version
+
+# ===== 编译产物 =====
+trafficSwitching
+trafficSwitching.exe
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# ===== 工具/IDE 本地数据 =====
+.rivet/
+.workbuddy/
+.idea/
+.vscode/
+*.swp
+*~
+
+# ===== 日志与临时文件 =====
+*.log
+logs/
+tmp/
+.DS_Store
+Thumbs.db

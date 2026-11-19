@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 	"trafficSwitching/api"
 	"trafficSwitching/common"
@@ -36,6 +37,12 @@ func Start() {
 	enable, project, source, service, intervalStr, url, salt := config.GetReportConfig()
 	if !enable {
 		log.Println("上报功能已禁用")
+		return
+	}
+
+	// 未配置上报地址时直接跳过（避免向空 URL 发请求产生无效错误日志）
+	if strings.TrimSpace(url) == "" {
+		log.Println("上报地址未配置（report.url / TS_REPORT_URL），上报功能跳过")
 		return
 	}
 

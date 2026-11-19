@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"log"
 	"net"
 	"net/http"
@@ -25,8 +26,29 @@ var (
 	// 缓存配置
 	maxCacheSize = 2
 
-	// 错误类型统计
-	errorTypeCount = make(map[string]*int64)
+	// 错误类型计数（类型有限，启动时预建，运行期零锁原子读写）
+	errorTypeCounters = map[string]*atomic.Int64{
+		"connection_refused": {},
+		"timeout":            {},
+		"dns_error":          {},
+		"connection_reset":   {},
+		"eof":                {},
+		"broken_pipe":        {},
+		"client_canceled":    {},
+		"backend_error":      {},
+	}
+
+	// 未注册错误类型的兜底归类（防止新增分类漏注册导致 nil deref）
+	fallbackErrorType = "backend_error"
+
+	// 响应体拷贝缓冲池：ReverseProxy 的 copyBuffer 会为每个响应分配 32KB 缓冲，
+	// 池化复用可显著降低大流量下的 GC 压力（BufferPool 为 httputil.BufferPool 接口）
+	copyBufferSize = 32 * 1024
+	copyBufferPool = sync.Pool{
+		New: func() any {
+			return make([]byte, copyBufferSize)
+		},
+	}
 
 	// 生产级高性能配置 - 针对Gateway 30个Pod优化
 	transport = &http.Transport{
@@ -58,7 +80,7 @@ var (
 )
 
 // 拦截逻辑封装：读取 O(1) 预计算字典并替换为底层小写
-func restoreLowerHeaders(headers http.Header, phase string) {
+func restoreLowerHeaders(headers http.Header) {
 	lowerMap := config.GetParsedLowerHeadersMap()
 	if len(lowerMap) == 0 {
 		return
@@ -72,6 +94,29 @@ func restoreLowerHeaders(headers http.Header, phase string) {
 			headers[lowerKey] = vals
 		}
 	}
+}
+
+// errorCounter 取错误类型对应的原子计数器；未注册类型兜底归入 fallbackErrorType，
+// 避免新增分类时漏注册触发 nil 指针解引用
+func errorCounter(errType string) *atomic.Int64 {
+	if c, ok := errorTypeCounters[errType]; ok {
+		return c
+	}
+	return errorTypeCounters[fallbackErrorType]
+}
+
+// bufferPool 把 sync.Pool 适配成 httputil.BufferPool 接口
+type bufferPool struct{}
+
+func (bufferPool) Get() []byte {
+	return copyBufferPool.Get().([]byte)
+}
+
+func (bufferPool) Put(b []byte) {
+	if cap(b) < copyBufferSize {
+		return // 非我方尺寸的切片不放回，避免池被污染
+	}
+	copyBufferPool.Put(b[:copyBufferSize])
 }
 
 // getOrCreateProxy 获取或创建代理实例
@@ -99,6 +144,8 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = transport
+	// 响应体拷贝改用对象池缓冲，避免每个请求新分配 32KB
+	proxy.BufferPool = bufferPool{}
 
 	// 设置 Director：透传或兜底设置 IP 头部
 	defaultDirector := proxy.Director
@@ -125,19 +172,16 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 		}
 
 		// 动态转换为小写 Header 发往后端
-		restoreLowerHeaders(req.Header, "发往后端请求")
-	}
-
-	// ModifyResponse: 请注意，不能在此处修改返回的小写头！
-	// 因为 ReverseProxy 会在这个函数执行完毕后，调用原生 copyHeader((w).Add)，使得我们的小写替换前功尽弃被再次大写化。
-	// 真正的返回头拦截我们移动到了下方的 proxyResponseWriter 中！
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		return nil
+		restoreLowerHeaders(req.Header)
 	}
 
 	// 错误处理 - 统计错误类型
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		w.Header().Set("X-Proxy-Error", "1") // 标记代理错误
+		// 标记代理层错误：走 request context 内部标志，
+		// 不写响应头（避免标记外泄给客户端，以及后端伪造同名头导致误判）
+		if mark, ok := r.Context().Value(proxyErrorMarkKey{}).(*proxyErrorMark); ok {
+			mark.set = true
+		}
 
 		// 识别错误类型
 		var errorType string
@@ -180,16 +224,13 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 			model.IncrementCanceled()
 		} else {
 			model.IncrementError()
+			// 代理层错误的状态码同样计入分桶，否则 status_5xx 与 errors 长期对不上
+			// （取消时响应已截断/客户端已走，不计入状态码统计）
+			model.RecordStatusCode(statusCode)
 		}
 
-		// 错误类型统计（轻量级）
-		proxyMutex.Lock()
-		if errorTypeCount[errorType] == nil {
-			var counter int64
-			errorTypeCount[errorType] = &counter
-		}
-		atomic.AddInt64(errorTypeCount[errorType], 1)
-		proxyMutex.Unlock()
+		// 错误类型统计（预建固定类型计数器，零锁）
+		errorCounter(errorType).Add(1)
 
 		// 条件日志（减少IO开销）
 		if currentErrors := atomic.LoadInt64(&model.ErrorRequests); currentErrors%1000 == 0 {
@@ -214,14 +255,24 @@ func getOrCreateProxy(backend string) *httputil.ReverseProxy {
 	return proxy
 }
 
+// proxyErrorMark 代理层错误标记（request context 内部通信，不经响应头）
+type proxyErrorMark struct {
+	set bool
+}
+
+// proxyErrorMarkKey context key 类型（私有类型防碰撞）
+type proxyErrorMarkKey struct{}
+
 // proxyResponseWriter 自定义写入包装器，用于在响应打给 TCP 网卡之前，夺取最高控制权
 type proxyResponseWriter struct {
 	http.ResponseWriter
 }
 
 // WriteHeader 拦截冲刷 HTTP Header 时的函数
+// 注意：响应头小写化不能放在 ModifyResponse——ReverseProxy 随后 copyHeader 用 Add 写入
+// 会重新 Canonical 化，必须在这里（写网卡前最后一刻）改底层 key 才生效
 func (w *proxyResponseWriter) WriteHeader(status int) {
-	restoreLowerHeaders(w.Header(), "发向前端响应")
+	restoreLowerHeaders(w.Header())
 	w.ResponseWriter.WriteHeader(status)
 }
 
@@ -276,22 +327,39 @@ func ProxyHandler(c *gin.Context) {
 		proxy = getOrCreateProxy(backend)
 		if proxy == nil {
 			model.IncrementError()
+			model.RecordStatusCode(http.StatusInternalServerError)
 			c.Header("Content-Type", "application/json")
 			c.String(http.StatusInternalServerError, string(model.ErrProxyInitError))
 			return
 		}
 	}
 
+	// 挂代理层错误标记，供 ErrorHandler 置位（同 goroutine 串行读写，无并发）
+	mark := &proxyErrorMark{}
+	c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), proxyErrorMarkKey{}, mark))
+
 	// 用我们的包裹器把 Gin 的默认响应包起来
 	pw := &proxyResponseWriter{ResponseWriter: c.Writer}
 
 	// 执行代理转发
-	proxy.ServeHTTP(pw, c.Request)
+	// ReverseProxy 在响应体流式复制中断时会故意 panic(http.ErrAbortHandler) 中止连接
+	// （Go issue 23643，绝大多数为客户端提前断开），此处捕获补记取消统计后原样上抛，
+	// 由路由层 recoveryMiddleware 放行给 net/http 静默关闭连接（响应已截断，不能按成功计）
+	func() {
+		defer func() {
+			if err := recover(); err != nil {
+				if err == http.ErrAbortHandler {
+					model.IncrementCanceled()
+				}
+				panic(err)
+			}
+		}()
+		proxy.ServeHTTP(pw, c.Request)
+	}()
 
-	// 判断成功/失败
-	// ErrorHandler 会设置特定的响应头标记代理错误
-	if pw.Header().Get("X-Proxy-Error") == "" {
-		// 代理成功（后端正常响应）
+	// 判断成功/失败：只要不是代理自身错误（能访问到后端并拿到响应），
+	// 后端返回的任何状态码（含 4xx/5xx）都算代理成功
+	if !mark.set {
 		model.IncrementSuccess()
 		// 记录后端状态码 (这里不能用 c.Writer.Status 因为可能被包裹了，改用原生)
 		model.RecordStatusCode(c.Writer.Status())
@@ -316,30 +384,18 @@ func GetProxyStats() *model.ProxyStats {
 	}
 }
 
-// GetErrorTypeStats 获取错误类型统计
+// GetErrorTypeStats 获取错误类型统计（固定类型只读 map，零锁）
 func GetErrorTypeStats() map[string]int64 {
-	proxyMutex.RLock()
-	defer proxyMutex.RUnlock()
-
-	errorStats := make(map[string]int64)
-	for errType, counter := range errorTypeCount {
-		if counter != nil {
-			errorStats[errType] = atomic.LoadInt64(counter)
-		}
+	errorStats := make(map[string]int64, len(errorTypeCounters))
+	for errType, counter := range errorTypeCounters {
+		errorStats[errType] = counter.Load()
 	}
 	return errorStats
 }
 
-// ResetErrorTypeStats 重置错误类型统计（每日重置时调用）
+// ResetErrorTypeStats 重置错误类型统计（每日重置时调用，零锁）
 func ResetErrorTypeStats() {
-	proxyMutex.Lock()
-	defer proxyMutex.Unlock()
-
-	for errType, counter := range errorTypeCount {
-		if counter != nil {
-			atomic.StoreInt64(counter, 0)
-		}
-		// 或者直接删除
-		delete(errorTypeCount, errType)
+	for _, counter := range errorTypeCounters {
+		counter.Store(0)
 	}
 }

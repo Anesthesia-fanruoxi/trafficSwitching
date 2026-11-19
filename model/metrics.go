@@ -121,16 +121,6 @@ func IncrementCanceled() {
 	atomic.AddInt64(&CanceledRequests, 1)
 }
 
-// GetCanceled 获取客户端取消数（历史累计）
-func GetCanceled() int64 {
-	return atomic.LoadInt64(&CanceledRequests)
-}
-
-// GetTodayCanceled 获取今日取消数
-func GetTodayCanceled() int64 {
-	return atomic.LoadInt64(&TodayCanceled)
-}
-
 // RecordStatusCode 记录后端状态码（同时更新今天和历史）
 func RecordStatusCode(status int) {
 	switch {
@@ -147,14 +137,6 @@ func RecordStatusCode(status int) {
 		atomic.AddInt64(&TodayStatus5xx, 1)
 		atomic.AddInt64(&Status5xx, 1)
 	}
-}
-
-// GetStatusCodeStats 获取状态码统计（历史累计）
-func GetStatusCodeStats() (s2xx, s3xx, s4xx, s5xx int64) {
-	return atomic.LoadInt64(&Status2xx),
-		atomic.LoadInt64(&Status3xx),
-		atomic.LoadInt64(&Status4xx),
-		atomic.LoadInt64(&Status5xx)
 }
 
 // GetTodayStats 获取今日统计
